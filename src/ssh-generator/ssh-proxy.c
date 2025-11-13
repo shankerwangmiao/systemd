@@ -127,6 +127,105 @@ static int process_vsock_mux(const char *path, const char *port) {
         if (r < 0)
                 return log_error_errno(r, "Failed to send CONNECT to %s:%s: %m", path, port);
 
+        struct timeval oldtv;
+        {
+                socklen_t oldtv_size = sizeof(oldtv);
+                r = getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &oldtv, &oldtv_size);
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to get socket receive timeout for %s: %m", path);
+                if (oldtv_size != sizeof(oldtv))
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Unexpected size of socket receive timeout for %s: %m", path);
+        }
+        {
+                struct timeval newtv = {
+                        .tv_sec = 5,
+                        .tv_usec = 0,
+                };
+                r = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &newtv, sizeof(newtv));
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to set socket receive timeout for %s: %m", path);
+        }
+        int old_peek_off;
+        r = getsockopt_int(fd, SOL_SOCKET, SO_PEEK_OFF, &old_peek_off);
+        if (r < 0)
+                return log_error_errno(-r, "Failed to get socket SO_PEEK_OFF for %s: %m", path);
+        r = setsockopt_int(fd, SOL_SOCKET, SO_PEEK_OFF, 0);
+        if (r < 0)
+                return log_error_errno(-r, "Failed to set socket SO_PEEK_OFF for %s: %m", path);
+
+        /* 10 is the size of "OK 65535\n" */
+        char recv_buf[10];
+        size_t bytes_avail = 0;
+        size_t pos = 0;
+        const char expected_prefix[] = "OK ";
+        const size_t expected_prefix_len = strlen(expected_prefix);
+
+        for (;;) {
+                if (pos >= bytes_avail) {
+                        if (bytes_avail < sizeof(recv_buf)) {
+                                ssize_t len = recv(fd, recv_buf + bytes_avail, sizeof(recv_buf) - bytes_avail, MSG_PEEK);
+                                if (len < 0) {
+                                        if (errno == EAGAIN) {
+                                                log_info("Timeout while waiting for OK PORT response from %s", path);
+                                                log_info("Assume the multiplexer will not send OK PORT.");
+                                                goto passout_fd;
+                                        } else
+                                                return log_error_errno(errno, "Failed to receive OK from %s: %m", path);
+                                } else if (len == 0) {
+                                        log_debug("Connection closed while waiting for OK PORT response from %s", path);
+                                        if (pos == 0) {
+                                                log_debug("No data received, which means the connecting port is not open.");
+                                                return log_error_errno(SYNTHETIC_ERRNO(ECONNREFUSED), "Port %s on %s is not open", port, path);
+                                        } else {
+                                                log_debug("Partial data received, but connection closed before full OK PORT response.");
+                                                log_debug("Assume the response is not valid OK PORT.");
+                                                log_debug("Give out fd without further processing.");
+                                                goto passout_fd;
+                                        }
+                                }
+                                bytes_avail += len;
+                        } else {
+                                log_debug("Received too many bytes while waiting for OK PORT response from %s", path);
+                                log_debug("Assume the response is not valid OK PORT.");
+                                log_debug("Give out fd without further processing.");
+                                goto passout_fd;
+                        }
+                }
+                assert(pos < bytes_avail);
+                if (pos < expected_prefix_len && recv_buf[pos] != expected_prefix[pos]) {
+                        log_debug("Received response does not match expected OK PORT response from %s", path);
+                        log_debug("Give out fd without further processing.");
+                        goto passout_fd;
+                } else if (recv_buf[pos] == '\n') {
+                        pos += 1;
+                        break;
+                }
+                pos += 1;
+        }
+
+        {
+                char buf_discard[sizeof(recv_buf)];
+                assert(pos <= sizeof(buf_discard));
+                ssize_t len = recv(fd, buf_discard, pos, 0);
+                if (len < 0)
+                        return log_error_errno(errno, "Failed to discard OK PORT response from %s: %m", path);
+                if ((size_t) len != pos)
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read while discarding OK PORT response from %s: %m", path);
+                log_debug("Successfully discarded response from %s: %.*s", path, (int) pos, buf_discard);
+        }
+
+passout_fd:
+        {
+                r = setsockopt_int(fd, SOL_SOCKET, SO_PEEK_OFF, old_peek_off);
+                if (r < 0)
+                        return log_error_errno(-r, "Failed to restore socket SO_PEEK_OFF for %s: %m", path);
+        }
+        {
+                r = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &oldtv, sizeof(oldtv));
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to restore socket receive timeout for %s: %m", path);
+        }
+
         r = send_one_fd_iov(STDOUT_FILENO, fd, &iovec_nul_byte, /* iovlen= */ 1, /* flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to send socket via STDOUT: %m");
